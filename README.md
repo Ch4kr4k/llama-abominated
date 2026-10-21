@@ -10,13 +10,13 @@
 
 A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) (branch `async-overlap`, based on upstream commit `781dbc5`) for hybrid CPU-GPU inference of mixture-of-experts models when most of the model has to stay in system RAM. It was built and tested on a laptop with a 4 GB GTX 1650 and an AVX2 CPU, running Qwen3.6-35B-A3B.
 
-Everything that works in llama.cpp at that commit works here: the same GGUF files, tools, server API and backends. With the new options off, the output matches stock llama.cpp exactly.
+Everything that works in llama.cpp at that commit works here: the same GGUF files, tools, server API and backends. With the new code paths turned off (`GGML_CPU_IQK=0`, `GGML_SCHED_PREFETCH=0`, no `-ser`/`--moe-n-expert`), the output matches stock llama.cpp exactly. The iqk kernels are on by default; their results differ from stock only by rounding (see `tests/test-iqk-mul-mat-id.cpp`).
 
 ## What this fork adds
 
 | Feature | What it does | Control |
 |---|---|---|
-| Faster CPU MoE kernels | AVX2 Q4_K/Q5_K/Q6_K `MUL_MAT_ID` kernels ported from [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp). Each weight block is unpacked once and reused for up to 8 tokens; experts with 32 or more tokens are converted (losslessly) to an interleaved 8-bit layout and run through a GEMM kernel. 1.15-1.4x faster prompt processing with the experts on the CPU. | On by default; `GGML_CPU_IQK=0` turns it off |
+| Faster CPU MoE kernels | AVX2 Q4_K/Q5_K/Q6_K `MUL_MAT_ID` kernels ported from [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp). Each weight block is unpacked once and reused for up to 8 tokens; experts with 32 or more tokens are converted to an interleaved 8-bit layout (near-lossless: the combined block scales are rounded to fp16) and run through a GEMM kernel. 1.15-1.4x faster prompt processing with the experts on the CPU. | On by default; `GGML_CPU_IQK=0` turns it off |
 | Async weight prefetch | When expert weights are copied to the GPU for a large batch, the next split's weights are uploaded on a second CUDA stream while the current split computes. Turns itself off if VRAM is short. | On by default; `GGML_SCHED_PREFETCH=0` turns it off, `3`/`4` uses more slots |
 | Offload policy | Sets the batch size from which weights in host memory are copied to the GPU (stock: 32), and which ops may be copied. | `--op-offload-min-batch N`, `--op-offload-ops LIST` (llama-bench `-oomb`) |
 | Expert reduction | Uses fewer experts per token. Decode is 7-14% faster; the quality cost has not been measured yet. | `--moe-n-expert N`, `-ser KMIN,T` |
@@ -50,9 +50,13 @@ The binaries are in `build/bin`:
 build/bin/llama-cli -m Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf -ngl 99 -ncmoe 40 -fa 1
 
 # OpenAI-compatible API server with the recommended settings
-build/bin/llama-server -m Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
-  -ngl 99 -ncmoe 40 -fa 1 -ctk q8_0 -ctv q8_0 -b 2048 -ub 1024 -t 4 \
-  --op-offload-min-batch 2048 --host 127.0.0.1 --port 8080
+# (agent use: 64K context, Qwen thinking-mode coding sampling, bounded thinking)
+build/bin/llama-server -m Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --jinja \
+  -c 65536 -ngl 99 -ncmoe 40 -fa 1 -ctk q8_0 -ctv q8_0 -b 2048 -ub 1024 -t 4 \
+  --op-offload-min-batch 2048 \
+  --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 0 --repeat-penalty 1.0 \
+  --reasoning-budget 8192 --reasoning-budget-message "Enough thinking, act now." \
+  --host 127.0.0.1 --port 8080
 
 # compare the old and new CPU kernels
 GGML_CPU_IQK=0 build/bin/llama-bench -m model.gguf -ngl 99 -ncmoe 40 -oomb 2048 -p 512 -n 64
