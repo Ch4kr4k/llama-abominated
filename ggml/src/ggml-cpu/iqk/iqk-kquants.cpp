@@ -1,4 +1,4 @@
-// AVX2 Q4_K/Q5_K/Q6_K x Q8_2_X4 MUL_MAT_ID kernels.
+// AVX2 Q4_K/Q5_K/Q6_K x Q8_2_X4 MUL_MAT and MUL_MAT_ID kernels.
 //
 // Ported from ik_llama.cpp (ggml/src/iqk/iqk_gemm_kquants.cpp, iqk_mul_mat.cpp,
 // iqk_common.h, iqk_quantize.cpp):
@@ -16,6 +16,7 @@
 #include "ggml-common.h"
 #include "ggml.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstdlib>
@@ -770,7 +771,102 @@ void ggml_iqk_mul_mat_moe(int64_t Nx, int64_t Ny, int64_t ne00, int64_t ne11,
     mm.mul_mat_NxM((int) ne00, (const char *)A + strideA*first_x, strideA, info, this_nrc_x, (int) Ny);
 }
 
+void ggml_iqk_mul_mat(int64_t Nx, int64_t Ny, int64_t ne00,
+                      int typeA, const void * A, size_t strideA,
+                      const void * B, size_t strideB,
+                      float * C, size_t strideC, int ith, int nth) {
+    constexpr int k_min_step = 32;
+    MulMat mm;
+
+    // few rows per thread: tile rows and columns, so every thread gets work
+    if (Nx/nth < k_min_step) {
+        if (!mm.prepare(typeA)) {
+            GGML_ABORT("iqk: unsupported type %d", typeA);
+        }
+        const int min_step = Ny <= 16 ? 16 : 32;
+        const int ntile_x = (int) ((Nx + min_step - 1)/min_step);
+        const int ntile_y = (int) ((Ny + min_step - 1)/min_step);
+        for (int itile = ith; itile < ntile_x*ntile_y; itile += nth) {
+            const int iy = (itile / ntile_x) * min_step;
+            const int ix = (itile % ntile_x) * min_step;
+            const int nrc_x = (int) std::min<int64_t>(min_step, Nx - ix);
+            const int nrc_y = (int) std::min<int64_t>(min_step, Ny - iy);
+            DataInfo info{C + ix, (const char *)B, strideC, strideB, iy, 1, nullptr, 0};
+            mm.mul_mat_NxM((int) ne00, (const char *)A + ix*strideA, strideA, info, nrc_x, iy + nrc_y);
+        }
+        return;
+    }
+
+    const int64_t npt = (Nx + nth - 1)/nth;
+
+    // with many columns, converting the weights to q8_1_r8 first pays off
+    if (npt >= 16 && Ny >= 32 && Nx % 8 == 0 && (typeA == GGML_TYPE_Q4_K || typeA == GGML_TYPE_Q5_K)) {
+        constexpr int k_x_step = 32;
+        mm.prepare_q8_1_r8();
+        int64_t nrc_x   = 8*((Nx/8 + nth - 1)/nth);
+        const int64_t first_x = ith*nrc_x;
+        if (first_x >= Nx) {
+            return;
+        }
+        if (first_x + nrc_x > Nx) nrc_x = Nx - first_x;
+        const size_t row_size_qx = (ne00/QK8_2)*sizeof(block_q8_2);
+        DataInfo info{C + first_x, (const char *)B, strideC, strideB, 0, 1, nullptr, 0};
+        thread_local std::vector<char> work;
+        if (work.size() < row_size_qx*k_x_step) work.resize(row_size_qx*k_x_step);
+        for (int64_t ix = 0; ix < nrc_x; ix += k_x_step) {
+            auto this_info = info;
+            this_info.s += ix;
+            const int this_nrc_x = (int) (ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix);
+            const char * a = (const char *)A + (first_x + ix)*strideA;
+            if (typeA == GGML_TYPE_Q4_K) {
+                convert_qX_k_q8_1_r8<block_q4_K, false>((int) ne00, a, strideA, work.data(), this_nrc_x);
+            } else {
+                convert_qX_k_q8_1_r8<block_q5_K, true>((int) ne00, a, strideA, work.data(), this_nrc_x);
+            }
+            mm.mul_mat_NxM((int) ne00, work.data(), row_size_qx, this_info, this_nrc_x, (int) Ny);
+        }
+        return;
+    }
+
+    if (!mm.prepare(typeA)) {
+        GGML_ABORT("iqk: unsupported type %d", typeA);
+    }
+
+    // few rows per thread but many columns: half the threads take each half of the columns
+    if (npt <= 16 && nth % 2 == 0 && Ny >= 16 && Ny % 2 == 0) {
+        const int nth_half = nth/2;
+        const int64_t half_x = (Nx + nth_half - 1)/nth_half;
+        const int64_t half_y = Ny/2;
+        const int64_t first_x = (ith % nth_half)*half_x;
+        if (first_x >= Nx) {
+            return;
+        }
+        const int nrc_x = (int) std::min(half_x, Nx - first_x);
+        const int64_t first_y = ith < nth_half ? 0 : half_y;
+        DataInfo info{C + first_x + first_y*strideC, (const char *)B + first_y*strideB, strideC, strideB, 0, 1, nullptr, 0};
+        mm.mul_mat_NxM((int) ne00, (const char *)A + first_x*strideA, strideA, info, nrc_x, (int) half_y);
+        return;
+    }
+
+    const int64_t first_x = ith*npt;
+    if (first_x >= Nx) {
+        return;
+    }
+    const int nrc_x = (int) std::min(npt, Nx - first_x);
+    DataInfo info{C + first_x, (const char *)B, strideC, strideB, 0, 1, nullptr, 0};
+    mm.mul_mat_NxM((int) ne00, (const char *)A + first_x*strideA, strideA, info, nrc_x, (int) Ny);
+}
+
 #else
+
+void ggml_iqk_mul_mat(int64_t Nx, int64_t Ny, int64_t ne00,
+                      int typeA, const void * A, size_t strideA,
+                      const void * B, size_t strideB,
+                      float * C, size_t strideC, int ith, int nth) {
+    (void) Nx; (void) Ny; (void) ne00; (void) typeA; (void) A; (void) strideA;
+    (void) B; (void) strideB; (void) C; (void) strideC; (void) ith; (void) nth;
+    GGML_ABORT("iqk: not available");
+}
 
 bool ggml_iqk_mul_mat_id_supported(int type, int64_t ne00) {
     (void) type;

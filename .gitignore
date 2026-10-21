@@ -153,6 +153,6 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
--e 
 # Claw
 /.claw/
+/overlay/

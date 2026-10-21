@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-// AVX2 Q4_K/Q5_K/Q6_K MUL_MAT_ID kernels ported from ik_llama.cpp (iqk_mul_mat, MIT).
+// AVX2 Q4_K/Q5_K/Q6_K MUL_MAT and MUL_MAT_ID kernels ported from ik_llama.cpp (iqk_mul_mat, MIT).
 // The activations are quantized to block_q8_2_x4 instead of the vec_dot_type (Q8_K).
 // GGML_CPU_IQK=0 disables them.
 
@@ -33,6 +33,14 @@ void ggml_iqk_mul_mat_moe(int64_t Nx, int64_t Ny, int64_t ne00, int64_t ne11,
                           const void * B, size_t strideB,
                           float * C, size_t nb1, size_t nb2,
                           const void * row_mapping, int ith, int nth);
+
+// dense MUL_MAT: C (Ny rows of Nx floats, row stride strideC floats) = A (Nx weight rows)
+// times B (Ny activation rows quantized with ggml_iqk_quantize_row_q8), work split over
+// nth threads as ik_llama.cpp's iqk_mul_mat does
+void ggml_iqk_mul_mat(int64_t Nx, int64_t Ny, int64_t ne00,
+                      int typeA, const void * A, size_t strideA,
+                      const void * B, size_t strideB,
+                      float * C, size_t strideC, int ith, int nth);
 
 #ifdef __cplusplus
 }

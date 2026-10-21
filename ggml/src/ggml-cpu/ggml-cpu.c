@@ -1266,10 +1266,6 @@ void ggml_compute_forward_mul_mat(
         return;
     }
 
-    // If tiled is supported, it will execute the full op here and we return
-    if (ggml_compute_forward_mul_mat_tiled(params, dst)) {
-        return;
-    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1325,6 +1321,46 @@ void ggml_compute_forward_mul_mat(
     }
 UseGgmlGemm1:;
 #endif
+
+    // iqk kernels (see iqk/iqk-kquants.h): src1 is quantized to their own q8 layout, which is
+    // never larger than a vec_dot_type (Q8_K) row, so the planned work buffer fits it.
+    // They go before the tiled path: measured on an AVX2 laptop (i5-10300H, 4 threads,
+    // 4096x14336) Q4_K 231 vs 110 GFLOPS at 8 rows and 359 vs 286 at 512, Q6_K 185 vs 78 at
+    // 8 rows; Q6_K has no q8_1_r8 conversion here, so for large batches tiled is faster
+    // (220 vs 269 GFLOPS at 512 rows) and keeps them.
+    if (!params->use_ref && src1->type == GGML_TYPE_F32 && src0->extra == NULL &&
+        ggml_iqk_mul_mat_id_supported(src0->type, ne00) &&
+        !(src0->type == GGML_TYPE_Q6_K && ne11 >= 128)) {
+        const size_t row_size = ggml_iqk_q8_row_size(ne10);
+        char * wdata = params->wdata;
+        assert(params->wsize >= ne13*ne12*ne11*row_size);
+        for (int64_t ir = ith; ir < ne13*ne12*ne11; ir += nth) {
+            const int64_t i13 = ir/(ne12*ne11);
+            const int64_t i12 = (ir - i13*ne12*ne11)/ne11;
+            const int64_t i11 = ir - i13*ne12*ne11 - i12*ne11;
+            ggml_iqk_quantize_row_q8((const float *)((const char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13),
+                                     wdata + ir*row_size, ne10);
+        }
+        ggml_barrier(params->threadpool);
+
+        const int64_t iqk_r2 = ne12 / ne02;
+        const int64_t iqk_r3 = ne13 / ne03;
+        for (int64_t i13 = 0; i13 < ne13; i13++) {
+            for (int64_t i12 = 0; i12 < ne12; i12++) {
+                ggml_iqk_mul_mat(ne01, ne11, ne00, src0->type,
+                                 (const char *) src0->data + i12/iqk_r2*nb02 + i13/iqk_r3*nb03, nb01,
+                                 wdata + (i13*ne12 + i12)*ne11*row_size, row_size,
+                                 (float *)((char *) dst->data + i12*nb2 + i13*nb3), nb1/sizeof(float),
+                                 ith, nth);
+            }
+        }
+        return;
+    }
+
+    // If tiled is supported, it will execute the full op here and we return
+    if (ggml_compute_forward_mul_mat_tiled(params, dst)) {
+        return;
+    }
 
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;

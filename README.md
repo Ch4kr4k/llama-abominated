@@ -8,15 +8,17 @@
 
 </div>
 
-A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) (branch `async-overlap`, based on upstream commit `781dbc5`) for hybrid CPU-GPU inference of mixture-of-experts models when most of the model has to stay in system RAM. It was built and tested on a laptop with a 4 GB GTX 1650 and an AVX2 CPU, running Qwen3.6-35B-A3B.
+A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) (based on upstream commit `781dbc5`, plus the later upstream fixes listed below) for hybrid CPU-GPU inference of mixture-of-experts models when most of the model has to stay in system RAM. It was built and tested on a laptop with a 4 GB GTX 1650 and an AVX2 CPU, running Qwen3.6-35B-A3B.
 
-Everything that works in llama.cpp at that commit works here: the same GGUF files, tools, server API and backends. With the new options off, the output matches stock llama.cpp exactly.
+Everything that works in llama.cpp at that commit works here: the same GGUF files, tools, server API and backends. With `GGML_CPU_IQK=0`, `GGML_SCHED_PREFETCH=0` and no `-ser`/`--moe-n-expert`, the output matches stock llama.cpp exactly (the faster CPU kernels are on by default).
 
 ## What this fork adds
 
 | Feature | What it does | Control |
 |---|---|---|
-| Faster CPU MoE kernels | AVX2 Q4_K/Q5_K/Q6_K `MUL_MAT_ID` kernels ported from [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp). Each weight block is unpacked once and reused for up to 8 tokens; experts with 32 or more tokens are converted (losslessly) to an interleaved 8-bit layout and run through a GEMM kernel. 1.15-1.4x faster prompt processing with the experts on the CPU. | On by default; `GGML_CPU_IQK=0` turns it off |
+| Faster CPU MoE kernels | AVX2 Q4_K/Q5_K/Q6_K `MUL_MAT_ID` kernels ported from [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp). Each weight block is unpacked once and reused for up to 8 tokens; experts with 32 or more tokens are converted to an interleaved 8-bit layout (near-lossless: the block scales are rounded to fp16; measured end to end it is slightly more accurate than stock) and run through a GEMM kernel. 1.15-1.4x faster prompt processing with the experts on the CPU. | On by default; `GGML_CPU_IQK=0` turns it off |
+| Faster CPU dense kernels | The same kernels for plain `MUL_MAT` (attention, shared experts, dense models on the CPU), with ik_llama.cpp's work split between threads. They run before upstream's tiled path: 2.1-2.4x faster at 8 rows, 1.26x at 512 rows for Q4_K. Q6_K with 128 or more rows keeps the tiled path, which is faster there. | Same switch; `GGML_CPU_IQK_REPACK=1` keeps dense Q4_K in upstream's repack buffer |
+| Upstream fixes | Cherry-picked from llama.cpp after `781dbc5`: `f174553` server checkpoint invalidation (stale state on hybrid/recurrent models such as Qwen3.6 when the client rewrites history), `99db719` CUDA flash-attention decode race, `5aeac37` flash-attention tile loop bound, `839a572` Qwen3.5/3.6 linear-attention output reshape. | Always on |
 | Async weight prefetch | When expert weights are copied to the GPU for a large batch, the next split's weights are uploaded on a second CUDA stream while the current split computes. Turns itself off if VRAM is short. | On by default; `GGML_SCHED_PREFETCH=0` turns it off, `3`/`4` uses more slots |
 | Offload policy | Sets the batch size from which weights in host memory are copied to the GPU (stock: 32), and which ops may be copied. | `--op-offload-min-batch N`, `--op-offload-ops LIST` (llama-bench `-oomb`) |
 | Expert reduction | Uses fewer experts per token. Decode is 7-14% faster; the quality cost has not been measured yet. | `--moe-n-expert N`, `-ser KMIN,T` |
@@ -49,14 +51,18 @@ The binaries are in `build/bin`:
 # chat in the terminal, experts of 40 layers kept on the CPU
 build/bin/llama-cli -m Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf -ngl 99 -ncmoe 40 -fa 1
 
-# OpenAI-compatible API server with the recommended settings
-build/bin/llama-server -m Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
-  -ngl 99 -ncmoe 40 -fa 1 -ctk q8_0 -ctv q8_0 -b 2048 -ub 1024 -t 4 \
-  --op-offload-min-batch 2048 --host 127.0.0.1 --port 8080
+# OpenAI-compatible API server with the recommended settings for a 4 GB GPU
+# (the -gpuQ6_K file is made below, under "Shrink the GPU-side weights")
+build/bin/llama-server -m Qwen3.6-35B-A3B-UD-Q4_K_XL-gpuQ6_K.gguf --jinja -c 65536 \
+  -ngl 99 -ncmoe 40 -fa 1 -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 -t 4 \
+  --op-offload-min-batch 4096 --host 127.0.0.1 --port 8080
 
 # compare the old and new CPU kernels
 GGML_CPU_IQK=0 build/bin/llama-bench -m model.gguf -ngl 99 -ncmoe 40 -oomb 2048 -p 512 -n 64
 build/bin/llama-bench -m model.gguf -ngl 99 -ncmoe 40 -oomb 2048 -p 512 -n 64
+
+# accuracy of the CPU kernels against an f64 reference (also run by ctest)
+build/bin/test-iqk-mul-mat 4 && GGML_CPU_IQK=0 build/bin/test-iqk-mul-mat 4
 ```
 
 `-hf user/repo` downloads a model from Hugging Face, as in upstream.
@@ -64,14 +70,48 @@ build/bin/llama-bench -m model.gguf -ngl 99 -ncmoe 40 -oomb 2048 -p 512 -n 64
 ### Tuning for a small GPU
 
 - Put all layers on the GPU (`-ngl 99`) and move the experts of the first N layers back to the CPU with `-ncmoe N`. Raise N until the model, KV cache and compute buffers fit in VRAM.
-- Use a large batch (`-b 2048 -ub 1024`) so prompts are processed in few passes.
-- With this fork's CPU kernels, keeping the experts on the CPU is usually faster than copying them to a small GPU for every batch: set `--op-offload-min-batch` above your `-ub`.
+- Use the largest batch that fits (`-b 2048 -ub 2048` with the smaller GPU-side weights below, else `-ub 1024`) so prompts are processed in few passes.
+- With this fork's CPU kernels, keeping the experts on the CPU is faster than copying them to a small GPU for every batch: set `--op-offload-min-batch` (or `GGML_OP_OFFLOAD_MIN_BATCH`) above your `-ub`. An older threshold of 640, measured before the kernel port, made 2048-token prompts 17% slower (95.8 vs 112.3 tok/s).
 - Use 4 threads (`-t`) on a 4-core CPU for decode. Decode speed is limited by RAM bandwidth.
 - Keep the default mmap loading. `-lm none` (pinned host buffers) turns off the CPU weight repacking and makes decode about 35% slower.
+- Leave the GPU's memory to the model: a desktop app drawing on the discrete GPU took 374 MiB here. On a laptop, let other programs use the integrated GPU.
+- Measure `-ub` above 1024 with `llama-server`, not `llama-bench`: llama-bench reserves logits for every token of the batch (2048 x 248k vocab = ~1.9 GB here) and runs out of VRAM, while the server reserves them for one token per sequence.
+
+### Shrink the GPU-side weights
+
+Unsloth's UD-Q4_K_XL keeps every tensor that lives on the GPU (attention, DeltaNet projections, shared experts, output head) at Q8_0: 2039 MiB of VRAM for Qwen3.6-35B-A3B. Requantizing those to Q6_K, and copying the experts unchanged, brings it to 1602 MiB, which is what makes room for `-ub 2048` and a 64k context on 4 GB. `llama-quantize` copies a tensor whose target type is its current type, so give every tensor its type in a `--tensor-type-file` (one anchored pattern per tensor, `^blk\.0\.ffn_up_exps\.weight$=q4_k`), with the Q8_0 matrices set to `q6_k` except the router (`ffn_gate_inp`), `attn_k`, `attn_v`, `ssm_alpha`, `ssm_beta` and `token_embd`, which stay `q8_0`. List the F32 tensors too (`=f32`): without them the default type turns some of them (here `ssm_alpha`/`ssm_beta` in 30 layers) into Q4_K.
+
+```sh
+build/bin/llama-quantize --allow-requantize --tensor-type-file types.txt \
+  Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf Qwen3.6-35B-A3B-UD-Q4_K_XL-gpuQ6_K.gguf Q4_K_M 4
+```
 
 ## Benchmarks
 
 Test machine: i5-10300H (4C/8T, AVX2), 32 GB DDR4-2933, GTX 1650 4 GB on PCIe 3.0.
+
+**Qwen3.6-35B-A3B in `llama-server`** (2026-10-21), one request per prompt with `cache_prompt: false`, 64 tokens generated, `-ngl 99 -ncmoe 40 -fa on -ctk q8_0 -ctv q8_0 -t 4`, nothing else running. Prompt and decode in tok/s, VRAM as reported by `nvidia-smi` after load:
+
+| Setup | 1.7k-token prompt | 6.8k | 13.6k | Decode | VRAM |
+|---|---:|---:|---:|---:|---:|
+| Before: UD-Q4_K_XL, `-ub 1024`, offload from 640 tokens, 32k context, build of 2026-10-18 | 74.0 | 95.8 | 90.8 | 18.8-20.7 | 3226 MiB |
+| gpuQ6_K file, `-ub 1024`, no expert offload, 32k | 81.6 | 99.1 | 91.3 | 19.8-22.0 | 2392 MiB |
+| gpuQ6_K, `-ub 2048`, 32k | 111.7 | 104.6 | 96.8 | 20.3-22.2 | 2544 MiB |
+| **gpuQ6_K, `-ub 2048`, 64k context (recommended)** | **115.3** | **107.1** | **97.8** | **21.2-23.8** | 3172 MiB |
+| gpuQ6_K, `-ub 4096`, 32k | 117.2 | 109.9 | 99.2 | 20.0-23.2 | 3200 MiB |
+
+- `-ub 2048` gains most on prompts that fit in one batch (+51% at 1.7k tokens); on long prompts attention over the growing context takes a larger share.
+- `-ub 4096` adds 2-5% for 656 MiB more VRAM; on 4 GB, a 64k context is the better use of that memory.
+- The prompt speed falls with depth because only 10 of the 40 layers use full attention, and those grow with the context.
+
+**Dense `MUL_MAT`, CPU** (`test-backend-ops perf`, m=4096, k=14336, 4 threads, GFLOPS). These ran while a llama-server used the other cores, so read them as ratios:
+
+| Rows (n) | Q4_K iqk | Q4_K tiled (upstream) | Q6_K iqk | Q6_K tiled |
+|---:|---:|---:|---:|---:|
+| 8 | **231** | 110 | **185** | 78 |
+| 512 | **359** | 286 | 220 | **269** |
+
+Below 8 rows the tiled path does not run; the iqk kernels measured 82, 167 and 219 GFLOPS at 1, 2 and 4 rows (upstream's plain dot products at those sizes were not measured). Accuracy, `test-iqk-mul-mat`: normalized squared error ~3e-5 with the iqk kernels and ~5e-5 with stock, on every `MUL_MAT` and `MUL_MAT_ID` case.
 
 **Qwen3.6-35B-A3B UD-Q4_K_XL**, tok/s, `-ngl 99 -ncmoe 40 -fa 1 -ctk q8_0 -ctv q8_0 -b 2048 -ub 1024 -t 4`:
 
@@ -129,6 +169,7 @@ The fork changes are tested on **CUDA** (NVIDIA) with an **x86 AVX2 CPU**. The o
 This fork:
 
 - [ASYNC_PREFETCH.md](ASYNC_PREFETCH.md) - design, measurements and open work
+- [tests/test-iqk-mul-mat.cpp](tests/test-iqk-mul-mat.cpp) - accuracy test of the CPU kernels (`ctest -R iqk` runs it with and without them)
 
 Upstream docs (still valid for this fork):
 
@@ -142,7 +183,7 @@ Upstream docs (still valid for this fork):
 ## Status
 
 - Personal fork, kept locally; not published and not intended for upstream as is.
-- To pick up new upstream changes, rebase the `async-overlap` branch on llama.cpp `master`.
+- To pick up new upstream changes, rebase the fork's commits on llama.cpp `master` (the fixes above were cherry-picked instead; expect conflicts mainly in `ggml-backend.cpp`).
 - Open work (quality of expert reduction, `--threads-batch 8`, more kernels): see section 10 of [ASYNC_PREFETCH.md](ASYNC_PREFETCH.md).
 
 ## Acknowledgements

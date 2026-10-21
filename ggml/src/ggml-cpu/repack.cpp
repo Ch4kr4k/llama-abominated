@@ -5200,7 +5200,8 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                 op->src[0]->buffer &&
                 (ggml_n_dims(op->src[0]) == 2) &&
                 op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type() &&
-                ggml_repack_get_optimal_repack_type(op->src[0])
+                ggml_repack_get_optimal_repack_type(op->src[0]) &&
+                !ggml_iqk_skip_repack(op->src[0]->type, op->src[0]->ne[0])
                 ) {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;

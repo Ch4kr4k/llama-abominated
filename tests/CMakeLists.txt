@@ -151,6 +151,13 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
 
+# The fork's CPU MUL_MAT and MUL_MAT_ID kernels (iqk) against an f64 reference, and the
+# stock kernels the same way (GGML_CPU_IQK is read once per process).
+llama_build(test-iqk-mul-mat.cpp)
+llama_test(test-iqk-mul-mat NAME test-iqk-mul-mat)
+llama_test(test-iqk-mul-mat NAME test-iqk-mul-mat-stock)
+set_tests_properties(test-iqk-mul-mat-stock PROPERTIES ENVIRONMENT GGML_CPU_IQK=0)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)
